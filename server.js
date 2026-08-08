@@ -110,6 +110,11 @@ async function refreshSession() {
       { timeout: 25000 }
     );
 
+    await page.goto("https://console.acefone.in/click_to_call_api_keys", {
+  waitUntil: "networkidle2",
+  timeout: 20000,
+    });
+
     const csrfToken = await page.evaluate(
       () =>
         document.querySelector("meta[name='csrf-token']")?.content ||
