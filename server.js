@@ -11,15 +11,94 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+// ─── FIX #1 (v2): FIREBASE_SERVICE_ACCOUNT loading ───────────────────────────
+// Manually pasting the whole service-account JSON into a .env value is very
+// error-prone — copy/paste from Word/Notion/some editors silently converts
+// straight quotes (") into "smart quotes" (" "), which breaks JSON.parse with
+// exactly the error you saw ("Expected property name or '}'"). So this now
+// supports TWO ways to provide credentials, and prefers the safer one:
+//
+//   Option A (recommended): FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccountKey.json
+//     Download the key file from Firebase Console → Project Settings →
+//     Service Accounts → Generate New Private Key, save it next to server.js
+//     as serviceAccountKey.json (add it to .gitignore!), and just point to it.
+//     No copy/paste of JSON into .env at all — zero chance of quote corruption.
+//     On Render: use the "Secret Files" feature to upload this same file at
+//     the same path, then set FIREBASE_SERVICE_ACCOUNT_PATH to that path.
+//
+//   Option B: FIREBASE_SERVICE_ACCOUNT=<single-line JSON> in .env (old way,
+//     kept for backwards compatibility). If this keeps failing, switch to
+//     Option A instead — it's simpler and avoids this whole class of bug.
+let serviceAccount;
+
+if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
+  const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+  try {
+    const raw = fs.readFileSync(keyPath, "utf8");
+    serviceAccount = JSON.parse(raw);
+    console.log("✅ Firebase credentials loaded from file:", keyPath);
+  } catch (e) {
+    console.error(`❌ Could not read/parse FIREBASE_SERVICE_ACCOUNT_PATH ("${keyPath}"):`, e.message);
+    process.exit(1);
+  }
+} else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  try {
+    serviceAccount = JSON.parse(raw);
+  } catch (e) {
+    // Print a diagnostic hexdump of the first ~20 chars so you can SEE the
+    // bad character (e.g. a curly quote 0x201C instead of a straight " 0x22).
+    const preview = raw.slice(0, 20);
+    const codes = [...preview].map((c) => `${c === '"' ? '"' : c}(U+${c.charCodeAt(0).toString(16).padStart(4, "0")})`).join(" ");
+    console.error(
+      "❌ FIREBASE_SERVICE_ACCOUNT is set but is not valid JSON.\n" +
+        "   Parse error:", e.message, "\n" +
+        "   First 20 characters + Unicode code points (look for anything that\n" +
+        "   is NOT U+0022, the straight double quote, where a quote should be):\n" +
+        "   " + codes + "\n\n" +
+        "   Strong recommendation: switch to FIREBASE_SERVICE_ACCOUNT_PATH instead —\n" +
+        "   save the downloaded key as serviceAccountKey.json next to server.js and set:\n" +
+        "   FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccountKey.json\n" +
+        "   This avoids manual JSON-in-.env copy/paste entirely."
+    );
+    process.exit(1);
+  }
+} else {
+  console.error(
+    "❌ No Firebase credentials found.\n" +
+      "   Set ONE of these in your .env:\n" +
+      "   FIREBASE_SERVICE_ACCOUNT_PATH=./serviceAccountKey.json   (recommended)\n" +
+      '   FIREBASE_SERVICE_ACCOUNT={"type":"service_account", ... }   (single line)\n' +
+      "   Restart the server after editing .env — it is only read on startup."
+  );
+  process.exit(1);
+}
+
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
 const PORT = Number(process.env.PORT || 5000);
 const ACEFONE_CALLER_ID = process.env.ACEFONE_CALLER_ID || "+918062491504";
 const ACEFONE_USER_ID = process.env.ACEFONE_USER_ID || "219085";
-const ACEFONE_EMAIL = process.env.ACEFONE_EMAIL || "customercare@adinath.net.in";
-const ACEFONE_PASSWORD = process.env.ACEFONE_PASSWORD || "Office@2005";
+
+// ─── FIX #2 (v2): switched from Puppeteer login-scraping to Acefone's
+// OFFICIAL Click-to-Call REST API. This removes the entire fragile
+// browser-automation/session.json/CSRF-cookie system — that was the actual
+// root cause of the intermittent 401s (Puppeteer failing to log in / stale
+// cookies / CSRF token expiring). The official API just needs a Bearer token.
+//
+// Get/renew this token from: Acefone Console → API Connect → API Tokens.
+// Per Acefone's docs, portal-generated tokens don't expire, but if you
+// generated this one via their "Generate a Token" API, it may have an
+// expiry (check the `exp` field by decoding the JWT) — Acefone provides a
+// "Refresh a Token" API for that case.
+const ACEFONE_TOKEN = process.env.ACEFONE_TOKEN;
+if (!ACEFONE_TOKEN) {
+  console.error(
+    "❌ ACEFONE_TOKEN is not set in .env — Click-to-Call will fail.\n" +
+      "   Get it from: Acefone Console → API Connect → API Tokens → Generate Token."
+  );
+}
 
 const AGENTS = [
   { id: "0502190850001", name: "Neelam", number: "919251651958" },
@@ -28,9 +107,6 @@ const AGENTS = [
   { id: "0502190850004", name: "Vikash Singhvi", number: "919509805201" },
   { id: "0502190850005", name: "Amit Sharma", number: "918094121221" },
 ];
-
-let sessionData = { cookieString: "", csrfToken: "" };
-let isRefreshing = false;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const num = (v) => {
@@ -63,92 +139,7 @@ function detectDirection(d) {
   return "inbound";
 }
 
-// ─── Session Management ───────────────────────────────────────────────────────
-function loadSession() {
-  try {
-    const raw = fs.readFileSync("./session.json", "utf8");
-    sessionData = JSON.parse(raw);
-    console.log("✅ Session loaded:", sessionData.savedAt);
-  } catch {
-    console.error("❌ session.json not found");
-  }
-}
-
-async function refreshSession() {
-  if (isRefreshing) {
-    await new Promise((r) => setTimeout(r, 8000));
-    return sessionData.csrfToken ? true : false;
-  }
-  isRefreshing = true;
-  console.log("🔄 Refreshing session...");
-
-  try {
-    const puppeteer = require("puppeteer");
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    });
-
-    const page = await browser.newPage();
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    );
-    await page.goto("https://console.acefone.in/login", {
-      waitUntil: "networkidle2",
-      timeout: 30000,
-    });
-    await page.waitForSelector("#loginId", { timeout: 15000 });
-
-    await page.$eval("#loginId", (el) => (el.value = ""));
-    await page.$eval("#password", (el) => (el.value = ""));
-    await page.type("#loginId", ACEFONE_EMAIL, { delay: 60 });
-    await page.type("#password", ACEFONE_PASSWORD, { delay: 60 });
-    await page.click("#login_button");
-
-    await page.waitForFunction(
-      () => !window.location.href.includes("/login"),
-      { timeout: 25000 }
-    );
-
-    await page.goto("https://console.acefone.in/click_to_call_api_keys", {
-  waitUntil: "networkidle2",
-  timeout: 20000,
-    });
-
-    const csrfToken = await page.evaluate(
-      () =>
-        document.querySelector("meta[name='csrf-token']")?.content ||
-        document.querySelector("input[name='_token']")?.value ||
-        ""
-    );
-
-    const cookies = await page.cookies();
-    const cookieString = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-
-    sessionData = {
-      cookieString,
-      csrfToken,
-      savedAt: new Date().toISOString(),
-    };
-    fs.writeFileSync("./session.json", JSON.stringify(sessionData, null, 2));
-
-    console.log("✅ Session refreshed:", sessionData.savedAt);
-    await browser.close();
-    isRefreshing = false;
-    return true;
-  } catch (err) {
-    console.error("❌ Session refresh failed:", err.message);
-    isRefreshing = false;
-    return false;
-  }
-}
-
-setInterval(() => {
-  console.log("⏰ Auto session refresh...");
-  refreshSession();
-}, 6 * 60 * 60 * 1000);
-
-// ─── Acefone Click-to-Call ────────────────────────────────────────────────────
+// ─── Acefone Click-to-Call (official API — no browser automation needed) ─────
 async function makeAcefoneCall(customerNumber, agentId) {
   const digits = String(customerNumber).replace(/\D/g, "").slice(-10);
   const phone = "91" + digits;
@@ -160,46 +151,24 @@ async function makeAcefoneCall(customerNumber, agentId) {
 
   console.log(`📞 Calling ${phone} via agent: ${agent.name} (${agent.id})`);
 
-  const doCall = async () => {
-    const params = new URLSearchParams({
-      phone_ctc: phone,
-      ctc_caller_id: ACEFONE_CALLER_ID,
-      ctc_agent_id: agent.id,
-      user_id: ACEFONE_USER_ID,
-      is_extension_call: "false",
-      _token: sessionData.csrfToken,
-    });
-
-    return fetch("https://console.acefone.in/click-to-call", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-CSRF-TOKEN": sessionData.csrfToken,
-        "X-Requested-With": "XMLHttpRequest",
-        Cookie: sessionData.cookieString,
-        Referer: "https://console.acefone.in/click_to_call_api_keys",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-      },
-      body: params.toString(),
-    });
-  };
-
-  let response = await doCall();
-
-  if (response.status === 419) {
-    console.log("⚠️ 419 — refreshing session...");
-    const ok = await refreshSession();
-    if (ok) {
-      console.log("🔁 Retrying call...");
-      response = await doCall();
-    }
-  }
+  const response = await fetch("https://api.acefone.in/v1/click_to_call", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ACEFONE_TOKEN}`,
+    },
+    body: JSON.stringify({
+      agent_number: agent.id, // Acefone Agent ID (050XXXXXXX)
+      destination_number: phone,
+      caller_id: ACEFONE_CALLER_ID.replace(/^\+/, ""),
+      async: 1,
+    }),
+  });
 
   return { response, agent };
 }
 
 // ✅ WEBHOOK HANDLER FUNCTION
-// ✅ WEBHOOK HANDLER - Recording URL properly saved
 async function handleWebhook(d, res) {
   try {
     console.log("🔔 Webhook Data:\n", JSON.stringify(d, null, 2));
@@ -209,20 +178,17 @@ async function handleWebhook(d, res) {
     const callTo = pick(d, "call_to_number");
     const callerNum = pick(d, "caller_id_number");
     const callStatus = pick(d, "call_status") || "completed";
-    
-    // ✅ RECORDING URL - Direct from webhook (with token)
+
     let recordingUrl = pick(d, "recording_url");
-    
     console.log(`🎙 Recording URL: ${recordingUrl ? "✅ Found" : "❌ Not found"}`);
 
     const billsec = num(pick(d, "billsec"));
     const duration = num(pick(d, "duration")) || billsec;
-    
-    // ✅ Handle answered_agent object or string
+
     let agentName = "";
     let agentNumber = "";
     let agentId = "";
-    
+
     const answeredAgent = d.answered_agent;
     if (answeredAgent && typeof answeredAgent === "object") {
       agentName = answeredAgent.name || "";
@@ -235,7 +201,7 @@ async function handleWebhook(d, res) {
     }
 
     const customerNoWithPrefix = pick(
-      d, 
+      d,
       "customer_no_with_prefix",
       "customer_number_with_prefix",
       "customer_no_with_prefix "
@@ -244,26 +210,22 @@ async function handleWebhook(d, res) {
     console.log(
       `📌 ${direction.toUpperCase()} | UUID: ${uuid} | Status: ${callStatus} | Duration: ${billsec}s | Agent: ${agentName} | Recording: ${recordingUrl ? "✅ Available" : "❌ None"}`
     );
-    // ✅ FINAL INBOUND CUSTOMER NUMBER FIX
-let clientNumber = "";
-let didNumber = "";
 
-if (direction === "inbound") {
-  clientNumber =
-    pick(d, "client_number") ||
-    pick(d, "caller_id_num") ||
-    pick(d, "customer_no_with_prefix") ||
-    "";
+    let clientNumber = "";
+    let didNumber = "";
 
-  didNumber =
-    pick(d, "did_number") ||
-    pick(d, "call_to_number") ||
-    "";
+    if (direction === "inbound") {
+      clientNumber =
+        pick(d, "client_number") ||
+        pick(d, "caller_id_num") ||
+        pick(d, "customer_no_with_prefix") ||
+        "";
 
-  // remove +91
-  clientNumber = String(clientNumber).replace(/^\+91/, "");
-  didNumber = String(didNumber).replace(/^\+91/, "");
-}
+      didNumber = pick(d, "did_number") || pick(d, "call_to_number") || "";
+
+      clientNumber = String(clientNumber).replace(/^\+91/, "");
+      didNumber = String(didNumber).replace(/^\+91/, "");
+    }
 
     const doc = {
       direction,
@@ -293,7 +255,7 @@ if (direction === "inbound") {
       campaign_name: pick(d, "campaign_name"),
       campaign_id: pick(d, "campaign_id"),
       broadcast_lead_fields: pick(d, "broadcast_lead_fields"),
-      recording_url: recordingUrl || "", // ✅ Save as-is
+      recording_url: recordingUrl || "",
       aws_call_recording_identifier: pick(d, "aws_call_recording_identifier"),
       reason_key: pick(d, "reason_key"),
       hangup_cause_description: pick(d, "hangup_cause_description"),
@@ -306,7 +268,6 @@ if (direction === "inbound") {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    // OUTBOUND: Update latest initiated call
     if (direction === "outbound") {
       const existing = await db
         .collection("calls")
@@ -324,15 +285,9 @@ if (direction === "inbound") {
           createdAt: prev.createdAt,
           leadId: prev.leadId || "",
           name: prev.name || "",
-          answered_agent_name:
-            agentName || prev.answered_agent_name || "",
-
-          answered_agent_number:
-            agentNumber || prev.answered_agent_number || "",
-
-          answered_agent:
-            agentId || prev.answered_agent || "",
-
+          answered_agent_name: agentName || prev.answered_agent_name || "",
+          answered_agent_number: agentNumber || prev.answered_agent_number || "",
+          answered_agent: agentId || prev.answered_agent || "",
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
@@ -344,14 +299,13 @@ if (direction === "inbound") {
       }
     }
 
-    // INBOUND: Create new
-    const newCall = await db.collection("calls").add({ 
-      ...doc, 
+    const newCall = await db.collection("calls").add({
+      ...doc,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       name: "",
       leadId: "",
     });
-    
+
     console.log(`✅ INBOUND created: ${newCall.id} | Recording: ${recordingUrl ? "✅" : "❌"}`);
     return res.status(200).send("OK");
   } catch (e) {
@@ -364,31 +318,19 @@ if (direction === "inbound") {
 app.get("/recording/:id", async (req, res) => {
   try {
     const doc = await db.collection("calls").doc(req.params.id).get();
-    if (!doc.exists) {
-      return res.status(404).send("Call not found");
-    }
+    if (!doc.exists) return res.status(404).send("Call not found");
 
     const data = doc.data();
     const url = data.recording_url;
+    if (!url) return res.status(404).send("No recording available");
 
-    if (!url) {
-      return res.status(404).send("No recording available");
-    }
-
-    // ✅ Proxy the recording through our server
-    // This allows playback even if Acefone requires authentication
     const response = await fetch(url);
-    
-    if (!response.ok) {
-      return res.status(404).send("Recording not accessible");
-    }
+    if (!response.ok) return res.status(404).send("Recording not accessible");
 
-    // Set proper headers for audio streaming
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    
-    // Stream the audio
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "public, max-age=3600");
+
     response.body.pipe(res);
   } catch (e) {
     console.error("Recording proxy error:", e);
@@ -396,13 +338,66 @@ app.get("/recording/:id", async (req, res) => {
   }
 });
 
+// ─── CONTACTS ─────────────────────────────────────────────────────────────────
 app.get("/contacts", async (req, res) => {
   try {
     const snap = await db.collection("contacts").get();
-    const contacts = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const contacts = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     res.json(contacts);
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── FIX #3: Dialer.jsx calls POST /contacts, PUT /contacts/:id and
+// DELETE /contacts/:id, but those routes never existed on the backend —
+// so "Add Contact" / "Edit Contact" / "Delete Contact" silently failed
+// (the frontend swallows the fetch error in a try/catch). Added below.
+app.post("/contacts", async (req, res) => {
+  try {
+    const { name, number, email, company, color } = req.body;
+    if (!name || !number) {
+      return res.status(400).json({ error: "Name and number are required" });
+    }
+    const ref = await db.collection("contacts").add({
+      name: name.trim(),
+      number: String(number).replace(/\D/g, ""),
+      email: email || "",
+      company: company || "",
+      color: color || "",
+      status: "offline",
+      lastCall: null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ id: ref.id, success: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.put("/contacts/:id", async (req, res) => {
+  try {
+    const { name, number, email, company, color } = req.body;
+    const update = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
+    if (name !== undefined) update.name = name.trim();
+    if (number !== undefined) update.number = String(number).replace(/\D/g, "");
+    if (email !== undefined) update.email = email;
+    if (company !== undefined) update.company = company;
+    if (color !== undefined) update.color = color;
+
+    await db.collection("contacts").doc(req.params.id).update(update);
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/contacts/:id", async (req, res) => {
+  try {
+    await db.collection("contacts").doc(req.params.id).delete();
+    return res.json({ success: true });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 });
 
@@ -410,23 +405,18 @@ app.get("/contacts", async (req, res) => {
 app.get("/recording-info/:id", async (req, res) => {
   try {
     const doc = await db.collection("calls").doc(req.params.id).get();
-    if (!doc.exists) {
-      return res.status(404).json({ error: "Call not found" });
-    }
+    if (!doc.exists) return res.status(404).json({ error: "Call not found" });
 
     const data = doc.data();
     const url = data.recording_url;
+    if (!url) return res.status(404).json({ error: "No recording available" });
 
-    if (!url) {
-      return res.status(404).json({ error: "No recording available" });
-    }
-
-    return res.json({ 
+    return res.json({
       url,
       callId: data.call_id,
       uuid: data.uuid,
       duration: data.billsec,
-      status: data.call_status
+      status: data.call_status,
     });
   } catch (e) {
     return res.status(500).json({ error: e.message });
@@ -434,7 +424,6 @@ app.get("/recording-info/:id", async (req, res) => {
 });
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-
 app.get("/", (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -456,15 +445,13 @@ app.get("/", (req, res) => {
         <h1>📡 Acefone Call Portal</h1>
         <div class="status">✅ Backend Running</div>
         <p>Server is active and ready to receive webhooks.</p>
-        
         <div class="endpoint">
           <div class="label">Webhook Endpoint:</div>
-          <div class="url">${req.protocol}://${req.get('host')}/webhook</div>
+          <div class="url">${req.protocol}://${req.get("host")}/webhook</div>
         </div>
-        
         <div class="endpoint">
           <div class="label">Time:</div>
-          <div class="url">${new Date().toLocaleString('en-IN')}</div>
+          <div class="url">${new Date().toLocaleString("en-IN")}</div>
         </div>
       </div>
     </body>
@@ -472,7 +459,6 @@ app.get("/", (req, res) => {
   `);
 });
 
-// ✅ WEBHOOK - Both GET and POST
 app.get("/webhook", async (req, res) => {
   return await handleWebhook(req.query || {}, res);
 });
@@ -487,54 +473,6 @@ app.get("/agents", (req, res) => res.json(AGENTS));
 app.get("/leads", async (req, res) => {
   try {
     const snap = await db.collection("leads").orderBy("createdAt", "desc").get();
-    return res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-app.post("/leads", async (req, res) => {
-  try {
-    const { number, name, notes } = req.body;
-    if (!number) return res.status(400).json({ error: "Number required" });
-    const ref = await db.collection("leads").add({
-      number, name: name || "", notes: notes || "", status: "pending", callCount: 0, createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return res.json({ id: ref.id });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-app.put("/leads/:id", async (req, res) => {
-  try {
-    const { number, name, notes, status } = req.body;
-    await db.collection("leads").doc(req.params.id).update({
-      number, name, notes, status, updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return res.json({ success: true });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete("/leads/:id", async (req, res) => {
-  try {
-    await db.collection("leads").doc(req.params.id).delete();
-    return res.json({ message: "Deleted" });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
-});
-
-// ═══════════════════════════════════════════════
-// LEAD MANAGEMENT ROUTES
-// ═══════════════════════════════════════════════
-
-// Get all leads
-app.get("/leads", async (req, res) => {
-  try {
-    const snap = await db.collection("leads").orderBy("createdAt", "desc").get();
     const leads = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     return res.json(leads);
   } catch (e) {
@@ -542,11 +480,10 @@ app.get("/leads", async (req, res) => {
   }
 });
 
-// Create single lead
 app.post("/leads", async (req, res) => {
   try {
     const { date, name, contact, city, propertyType, remarks, status, calledBy } = req.body;
-    
+
     if (!name || !contact) {
       return res.status(400).json({ error: "Name and contact are required" });
     }
@@ -573,11 +510,9 @@ app.post("/leads", async (req, res) => {
   }
 });
 
-// Bulk upload leads
 app.post("/leads/bulk", async (req, res) => {
   try {
     const leads = req.body;
-    
     if (!Array.isArray(leads) || leads.length === 0) {
       return res.status(400).json({ error: "Invalid data format" });
     }
@@ -613,23 +548,11 @@ app.post("/leads/bulk", async (req, res) => {
   }
 });
 
-// Update lead
 app.put("/leads/:id", async (req, res) => {
   try {
-    const {
-      name,
-      contact,
-      city,
-      propertyType,
-      remarks,
-      status,
-      calledBy,
-      followUps,
-    } = req.body;
+    const { name, contact, city, propertyType, remarks, status, calledBy, followUps } = req.body;
 
-    const updateData = {
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
+    const updateData = { updatedAt: admin.firestore.FieldValue.serverTimestamp() };
 
     if (name !== undefined) updateData.name = name.trim();
     if (contact !== undefined) updateData.contact = contact.trim();
@@ -640,7 +563,6 @@ app.put("/leads/:id", async (req, res) => {
     if (calledBy !== undefined) updateData.calledBy = calledBy;
     if (followUps !== undefined) updateData.followUps = followUps;
 
-    // If status changed from "Not Called", increment call count
     if (status && status !== "Not Called") {
       const doc = await db.collection("leads").doc(req.params.id).get();
       if (doc.exists && (!doc.data().status || doc.data().status === "Not Called")) {
@@ -656,7 +578,6 @@ app.put("/leads/:id", async (req, res) => {
   }
 });
 
-// Delete lead
 app.delete("/leads/:id", async (req, res) => {
   try {
     await db.collection("leads").doc(req.params.id).delete();
@@ -666,23 +587,15 @@ app.delete("/leads/:id", async (req, res) => {
   }
 });
 
-// Get lead history
 app.get("/leads/:id/history", async (req, res) => {
   try {
     const leadDoc = await db.collection("leads").doc(req.params.id).get();
-    if (!leadDoc.exists) {
-      return res.status(404).json({ error: "Lead not found" });
-    }
+    if (!leadDoc.exists) return res.status(404).json({ error: "Lead not found" });
 
     const leadData = leadDoc.data();
     const contact = leadData.contact;
 
-    // Find all call logs for this contact
-    const callsSnap = await db
-      .collection("calls")
-      .orderBy("createdAt", "desc")
-      .limit(100)
-      .get();
+    const callsSnap = await db.collection("calls").orderBy("createdAt", "desc").limit(100).get();
 
     const history = callsSnap.docs
       .filter((doc) => {
@@ -710,30 +623,20 @@ app.get("/leads/:id/history", async (req, res) => {
   }
 });
 
-// Export leads to Excel
 app.get("/leads/export", async (req, res) => {
   try {
     const { date, status } = req.query;
 
     let query = db.collection("leads").orderBy("createdAt", "desc");
-
     const snap = await query.get();
     let leads = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-    // Filter by date
-    if (date) {
-      leads = leads.filter((l) => l.date === date);
-    }
-
-    // Filter by status
-    if (status) {
-      leads = leads.filter((l) => l.status === status);
-    }
+    if (date) leads = leads.filter((l) => l.date === date);
+    if (status) leads = leads.filter((l) => l.status === status);
 
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Leads");
 
-    // Define columns
     sheet.columns = [
       { header: "Date", key: "date", width: 12 },
       { header: "Name", key: "name", width: 25 },
@@ -750,17 +653,11 @@ app.get("/leads/export", async (req, res) => {
       { header: "Follow Up 3", key: "followUp3", width: 30 },
     ];
 
-    // Style header
     sheet.getRow(1).font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
-    sheet.getRow(1).fill = {
-      type: "pattern",
-      pattern: "solid",
-      fgColor: { argb: "FF2C3E6B" },
-    };
+    sheet.getRow(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2C3E6B" } };
     sheet.getRow(1).alignment = { horizontal: "center", vertical: "middle" };
     sheet.getRow(1).height = 25;
 
-    // Add data
     leads.forEach((lead, index) => {
       const row = sheet.addRow({
         date: lead.date || "—",
@@ -774,9 +671,7 @@ app.get("/leads/export", async (req, res) => {
         callCount: lead.callCount || 0,
         lastCalledAt: lead.lastCalledAt
           ? new Date(
-              lead.lastCalledAt._seconds
-                ? lead.lastCalledAt._seconds * 1000
-                : lead.lastCalledAt
+              lead.lastCalledAt._seconds ? lead.lastCalledAt._seconds * 1000 : lead.lastCalledAt
             ).toLocaleString("en-IN")
           : "—",
         followUp1: lead.followUps?.[0]
@@ -790,32 +685,17 @@ app.get("/leads/export", async (req, res) => {
           : "—",
       });
 
-      // Alternate row colors
       if (index % 2 === 0) {
-        row.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFF8FAFC" },
-        };
+        row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF8FAFC" } };
       }
-
-      // Highlight "Not Called" rows
       if (!lead.status || lead.status === "Not Called") {
-        row.fill = {
-          type: "pattern",
-          pattern: "solid",
-          fgColor: { argb: "FFFFFBEB" },
-        };
+        row.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFBEB" } };
       }
     });
 
-    // Auto-filter
     sheet.autoFilter = { from: "A1", to: "M1" };
-
-    // Freeze header row
     sheet.views = [{ state: "frozen", ySplit: 1 }];
 
-    // Add borders
     sheet.eachRow({ includeEmpty: false }, (row) => {
       row.eachCell({ includeEmpty: false }, (cell) => {
         cell.border = {
@@ -827,14 +707,8 @@ app.get("/leads/export", async (req, res) => {
       });
     });
 
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename=leads-${new Date().toISOString().split("T")[0]}.xlsx`
-    );
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename=leads-${new Date().toISOString().split("T")[0]}.xlsx`);
 
     await workbook.xlsx.write(res);
     res.end();
@@ -853,10 +727,11 @@ app.post("/call", async (req, res) => {
     if (!agentId) return res.status(400).json({ error: "Please select an agent" });
 
     const { response, agent } = await makeAcefoneCall(customer, agentId);
-    const text = await response.text();
-    console.log("Acefone →", response.status, text);
+    const json = await response.json().catch(() => ({}));
+    console.log("Acefone →", response.status, json);
 
     const digits = String(customer).replace(/\D/g, "").slice(-10);
+    const refId = json.ref_id || "";
 
     const callDoc = await db.collection("calls").add({
       direction: "outbound",
@@ -867,14 +742,15 @@ app.post("/call", async (req, res) => {
       answered_agent: agent.id,
       name: name || "",
       leadId: leadId || "",
-      call_status: response.ok ? "initiated" : "failed",
+      call_status: json.success ? "initiated" : "failed",
+      ref_id: refId, // used to match the async webhook back to this record
       recording_url: "",
       billsec: 0,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    console.log(`✅ Call logged: ${callDoc.id} | Agent: ${agent.name}`);
+    console.log(`✅ Call logged: ${callDoc.id} | Agent: ${agent.name} | ref_id: ${refId}`);
 
     if (leadId) {
       const lRef = db.collection("leads").doc(leadId);
@@ -882,24 +758,54 @@ app.post("/call", async (req, res) => {
       if (lDoc.exists) {
         await lRef.update({
           callCount: (lDoc.data().callCount || 0) + 1,
-          status: response.ok ? "called" : "failed",
+          status: json.success ? "called" : "failed",
           lastCalledAt: admin.firestore.FieldValue.serverTimestamp(),
           lastAgent: agent.name,
         });
       }
     }
 
-    if (response.status === 419) {
-      return res.status(401).json({ error: "Session expired — please refresh" });
+    if (json.success) {
+      // Acefone's API is asynchronous: this only means the request was
+      // accepted, NOT that the call connected. Actual progress arrives via
+      // /webhook. The frontend polls /call-status/:id, which reads whatever
+      // the webhook has written to this Firestore doc.
+      return res.json({ success: true, agent: agent.name, callId: callDoc.id, refId });
     }
 
-    if (response.ok) {
-      return res.json({ success: true, agent: agent.name });
-    }
-
-    return res.status(response.status).json({ error: "Call failed", details: text });
+    return res.status(response.status || 400).json({ error: json.message || "Call failed", details: json });
   } catch (e) {
     console.error("Call error:", e);
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// ─── FIX #5: these two routes did not exist before, so the dialer's
+// call-status polling and the "End Call" button were silently failing
+// (Dialer.jsx already calls them, it just had nothing to talk to). ────────────
+app.get("/call-status/:id", async (req, res) => {
+  try {
+    const doc = await db.collection("calls").doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: "Call not found" });
+    const data = doc.data();
+    return res.json({ status: data.call_status || "unknown", ...data });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/call/:id/end", async (req, res) => {
+  try {
+    // Acefone's click-to-call API doesn't expose a public "hang up" endpoint,
+    // so this marks the call as completed in our own records. The webhook
+    // will still overwrite this with the real final status once Acefone
+    // sends it.
+    await db.collection("calls").doc(req.params.id).update({
+      call_status: "completed",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return res.json({ success: true });
+  } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 });
@@ -908,16 +814,11 @@ app.post("/call", async (req, res) => {
 app.get("/recording-proxy/:id", async (req, res) => {
   try {
     const doc = await db.collection("calls").doc(req.params.id).get();
-    if (!doc.exists) {
-      return res.status(404).json({ error: "Call not found" });
-    }
+    if (!doc.exists) return res.status(404).json({ error: "Call not found" });
 
     const data = doc.data();
     const url = data.recording_url || "";
-
-    if (!url) {
-      return res.status(404).json({ error: "No recording available" });
-    }
+    if (!url) return res.status(404).json({ error: "No recording available" });
 
     return res.json({ url });
   } catch (e) {
@@ -932,8 +833,7 @@ app.get("/call-logs", async (req, res) => {
     const lim = Math.min(Number(req.query.limit) || 200, 500);
 
     let ref = db.collection("calls").orderBy("createdAt", "desc").limit(lim);
-    if (direction && direction !== "all")
-      ref = ref.where("direction", "==", direction);
+    if (direction && direction !== "all") ref = ref.where("direction", "==", direction);
 
     const snap = await ref.get();
     let logs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -974,8 +874,7 @@ app.get("/export-excel", async (req, res) => {
     const { direction, status, agent, dateFrom, dateTo } = req.query;
 
     let ref = db.collection("calls").orderBy("createdAt", "desc").limit(1000);
-    if (direction && direction !== "all")
-      ref = ref.where("direction", "==", direction);
+    if (direction && direction !== "all") ref = ref.where("direction", "==", direction);
 
     const snap = await ref.get();
     let calls = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
@@ -1117,8 +1016,7 @@ app.get("/stats", async (req, res) => {
     const agentStats = {};
     calls.forEach((c) => {
       const name = c.answered_agent_name || "Unknown";
-      if (!agentStats[name])
-        agentStats[name] = { name, calls: 0, duration: 0, missed: 0 };
+      if (!agentStats[name]) agentStats[name] = { name, calls: 0, duration: 0, missed: 0 };
       agentStats[name].calls++;
       agentStats[name].duration += Number(c.billsec || 0);
       if (["missed", "no-answer", "failed"].includes((c.call_status || "").toLowerCase()))
@@ -1142,10 +1040,22 @@ app.get("/stats", async (req, res) => {
   }
 });
 
-app.post("/refresh-session", async (req, res) => {
-  const ok = await refreshSession();
-  if (ok) return res.json({ success: true, savedAt: sessionData.savedAt });
-  return res.status(500).json({ error: "Session refresh failed" });
+// Quick sanity check that ACEFONE_TOKEN is set and accepted by Acefone.
+// (Doesn't place a real call — just validates auth by calling a lightweight
+// read endpoint.)
+app.get("/check-acefone-auth", async (req, res) => {
+  if (!ACEFONE_TOKEN) {
+    return res.status(500).json({ ok: false, error: "ACEFONE_TOKEN not set in .env" });
+  }
+  try {
+    const r = await fetch("https://api.acefone.in/v1/active_calls", {
+      headers: { Authorization: `Bearer ${ACEFONE_TOKEN}` },
+    });
+    const body = await r.json().catch(() => ({}));
+    return res.json({ ok: r.ok, status: r.status, body });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ─── REMARKS ─────────────────────────────────────
@@ -1156,7 +1066,8 @@ app.post("/remarks", async (req, res) => {
       return res.status(400).json({ error: "callId & remark required" });
     }
     await db.collection("remarks").add({
-      callId, remark, outcome: outcome || "", followUpDate: followUpDate || null, createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      callId, remark, outcome: outcome || "", followUpDate: followUpDate || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     res.json({ success: true });
   } catch (e) {
@@ -1172,10 +1083,7 @@ app.get("/remarks/:callId", async (req, res) => {
       .limit(5)
       .get();
 
-    res.json(snap.docs.map(d => ({
-      id: d.id,
-      ...d.data()
-    })));
+    res.json(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1184,13 +1092,13 @@ app.get("/remarks/:callId", async (req, res) => {
 // ─── CUSTOMER HISTORY ─────────────────────────
 app.get("/customer-history/:number", async (req, res) => {
   try {
-    const num = req.params.number.replace(/\D/g, "").slice(-10);
+    const n = req.params.number.replace(/\D/g, "").slice(-10);
     const snap = await db.collection("calls").orderBy("createdAt", "desc").limit(20).get();
     const calls = snap.docs
       .map((d) => ({ id: d.id, ...d.data() }))
       .filter((c) =>
         [c.call_to_number, c.caller_id_number, c.customer_no_with_prefix].some(
-          (v) => v && String(v).includes(num)
+          (v) => v && String(v).includes(n)
         )
       );
     res.json(calls);
@@ -1198,7 +1106,6 @@ app.get("/customer-history/:number", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 
 app.patch("/call-logs/:id", async (req, res) => {
   try {
@@ -1229,20 +1136,15 @@ app.listen(PORT, async () => {
 ║   🚀 Acefone Call Portal Backend                             ║
 ║                                                              ║
 ║   ✅ Server Running: http://localhost:${PORT}                ║
-║     
+║                                                              ║
 ║   📡 Webhook: /webhook (GET & POST)                          ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
   `);
 
-  loadSession();
-
-  if (sessionData.savedAt) {
-    const savedTime = new Date(sessionData.savedAt).getTime();
-    const hoursSince = (Date.now() - savedTime) / (1000 * 60 * 60);
-    if (hoursSince > 5) {
-      console.log(`⚠️ Session ${Math.round(hoursSince)}h old — refreshing...`);
-      await refreshSession();
-    }
+  if (ACEFONE_TOKEN) {
+    console.log("✅ ACEFONE_TOKEN found — using official Click-to-Call API (no browser login needed)");
+  } else {
+    console.error("❌ ACEFONE_TOKEN missing — calls will fail until you add it to .env");
   }
 });
