@@ -391,6 +391,16 @@ app.get("/recording/:id", async (req, res) => {
   }
 });
 
+app.get("/contacts", async (req, res) => {
+  try {
+    const snap = await db.collection("contacts").get();
+    const contacts = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    res.json(contacts);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ✅ Get recording info (URL only)
 app.get("/recording-info/:id", async (req, res) => {
   try {
